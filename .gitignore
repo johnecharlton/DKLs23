@@ -1,4 +1,6 @@
 /target
+.DS_Store
+.idea/
 # coder workflow artifacts
 .gemini/
 .coder/

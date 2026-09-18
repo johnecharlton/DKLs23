@@ -480,6 +480,14 @@ impl Abort {
     }
 }
 
+impl fmt::Display for Abort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.reason, f)
+    }
+}
+
+impl std::error::Error for Abort {}
+
 /// Saves the sender and receiver of a message.
 #[derive(Clone, Debug, Zeroize)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
