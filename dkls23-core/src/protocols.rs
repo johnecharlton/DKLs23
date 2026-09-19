@@ -18,6 +18,7 @@ pub mod dkg_session;
 #[cfg(feature = "serde")]
 pub mod messages;
 pub mod re_key;
+pub mod reconstruction;
 pub mod refresh;
 pub mod sign_session;
 pub mod signature;

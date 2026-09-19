@@ -10,6 +10,7 @@ This crate provides the cryptographic primitives and protocol logic for:
 - **Distributed Key Generation (DKG)** — generate key shares without a trusted dealer
 - **Threshold Signing** — produce ECDSA signatures with a subset of parties
 - **Key Refresh** — rotate key shares without changing the public key
+- **Key Reconstruction** — recover the secret key from a threshold set of key shares
 - **BIP-32 Derivation** — derive child keys from a master key share
 
 ## Usage

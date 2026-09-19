@@ -133,6 +133,7 @@ fn double_sha256_checksum(data: &[u8]) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dkls23_core::protocols::{re_key::re_key, reconstruction::reconstruct, Parameters};
     use elliptic_curve::CurveArithmetic;
     use rustcrypto_group::prime::PrimeCurveAffine;
 
@@ -170,5 +171,24 @@ mod tests {
             "Sui address should be 66 chars (0x + 64 hex), got: {}",
             address.len()
         );
+    }
+
+    #[test]
+    fn test_reconstruction() {
+        let parameters = Parameters::new(2, 5).unwrap();
+        let secret_key = p256::Scalar::from(42u64);
+        let (mut parties, _) = re_key::<p256::NistP256>(
+            &parameters,
+            b"reconstruction",
+            &secret_key,
+            None,
+            compute_neo3_address,
+        );
+
+        assert_eq!(*reconstruct(&parties).unwrap(), secret_key);
+
+        parties.swap(0, 4);
+        parties.swap(1, 2);
+        assert_eq!(*reconstruct(&parties[..2]).unwrap(), secret_key);
     }
 }
