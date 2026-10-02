@@ -355,13 +355,9 @@ pub(crate) fn step3<C: DklsCurve>(
 ///
 /// # Errors
 ///
-/// Will return `Err` if one of the proofs/commitments doesn't
-/// verify or if the consistency check for the public key fails.
-///
-/// # Panics
-///
-/// Will panic if the list of indices in `proofs_commitments`
-/// are not the numbers from 1 to `parameters.share_count`.
+/// Will return `Err` if a proof index is out of range or duplicated,
+/// a committed point is missing, one of the proofs/commitments doesn't
+/// verify or the consistency check for the public key fails.
 pub(crate) fn step5<C: DklsCurve>(
     parameters: &Parameters,
     party_index: PartyIndex,
@@ -372,6 +368,25 @@ pub(crate) fn step5<C: DklsCurve>(
 
     // Verify the proofs and gather the committed points.
     for party_j in proofs_commitments {
+        if party_j.index.as_u8() > parameters.share_count {
+            return Err(Abort::recoverable(
+                party_index,
+                AbortReason::UnexpectedSender {
+                    sender: party_j.index,
+                },
+            ));
+        }
+        if committed_points
+            .insert(party_j.index, party_j.proof.point)
+            .is_some()
+        {
+            return Err(Abort::recoverable(
+                party_index,
+                AbortReason::DuplicateSender {
+                    sender: party_j.index,
+                },
+            ));
+        }
         if party_j.index != party_index {
             let verification =
                 DLogProof::<C>::decommit_verify(&party_j.proof, &party_j.commitment, session_id);
@@ -384,7 +399,6 @@ pub(crate) fn step5<C: DklsCurve>(
                 ));
             }
         }
-        committed_points.insert(party_j.index, party_j.proof.point);
     }
 
     // Initializes what will be the public key.
@@ -1382,6 +1396,67 @@ mod tests {
 
         assert!(p1_result.is_ok());
         assert!(p2_result.is_ok());
+    }
+
+    /// Tests if reconstruction rejects duplicate proof indices.
+    #[test]
+    fn test_dkg_rejects_duplicate_proof_indices() {
+        let parameters = Parameters {
+            threshold: 2,
+            share_count: 2,
+        };
+        let session_id = rng::get_rng().random::<[u8; crate::utilities::ID_LEN]>();
+        let party_index = PartyIndex::new(1).unwrap();
+
+        let mut proofs_commitments = Vec::with_capacity(parameters.share_count as usize);
+        for i in 1..=parameters.share_count {
+            let (_, proof_commitment) = step3::<TestCurve>(
+                PartyIndex::new(i).unwrap(),
+                &session_id,
+                &[Scalar::from(u64::from(i) + 2)],
+            );
+            proofs_commitments.push(proof_commitment);
+        }
+
+        for proof_commitment in &proofs_commitments {
+            let mut duplicated = proofs_commitments.clone();
+            duplicated.push(proof_commitment.clone());
+
+            let abort = step5::<TestCurve>(&parameters, party_index, &session_id, &duplicated)
+                .expect_err("duplicate proof index should be rejected");
+            assert!(matches!(
+                abort.reason,
+                AbortReason::DuplicateSender { sender } if sender == proof_commitment.index
+            ));
+        }
+    }
+
+    /// Tests if reconstruction rejects proof indices outside the participant set.
+    #[test]
+    fn test_dkg_rejects_out_of_range_proof_indices() {
+        let parameters = Parameters {
+            threshold: 2,
+            share_count: 2,
+        };
+        let session_id = rng::get_rng().random::<[u8; crate::utilities::ID_LEN]>();
+        let party_index = PartyIndex::new(1).unwrap();
+
+        let mut proofs_commitments = Vec::with_capacity(3);
+        for i in 1..=3 {
+            let (_, proof_commitment) = step3::<TestCurve>(
+                PartyIndex::new(i).unwrap(),
+                &session_id,
+                &[Scalar::from(u64::from(i) + 2)],
+            );
+            proofs_commitments.push(proof_commitment);
+        }
+
+        let abort = step5::<TestCurve>(&parameters, party_index, &session_id, &proofs_commitments)
+            .expect_err("out-of-range proof index should be rejected");
+        assert!(matches!(
+            abort.reason,
+            AbortReason::UnexpectedSender { sender } if sender.as_u8() == 3
+        ));
     }
 
     /// Tests if the main steps of the protocol do not generate
