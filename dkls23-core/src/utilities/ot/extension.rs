@@ -505,13 +505,18 @@ impl OTEReceiver {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if the base OT fails (see the file above).
+    /// Will return `Err` if the encryption proof vector does not have length [`KAPPA`]
+    /// or if the base OT fails (see the file above).
     pub fn init_phase2<C: DklsCurve>(
         ot_sender: &OTSender<C>,
         session_id: &[u8],
         seed: &Seed,
         enc_proofs: &[EncProof<C>],
     ) -> Result<OTEReceiver, ErrorOT> {
+        if enc_proofs.len() != KAPPA as usize {
+            return Err(ErrorOT::new("Encryption proof vector has incorrect length"));
+        }
+
         // The outputs from the base OT become the receiver's seeds.
         let (seeds0, seeds1) = ot_sender.run_phase2_batch(session_id, seed, enc_proofs)?;
 
@@ -1069,6 +1074,31 @@ mod tests {
         let malformed = vec![[0u8; (EXTENDED_BATCH_SIZE / 8) as usize]; (KAPPA as usize) - 1];
         let error = cut_and_transpose(&malformed).expect_err("wrong row count should fail");
         assert!(error.description.contains("incorrect dimensions"));
+    }
+
+    /// Tests if receiver-side OTE initialization rejects incorrect proof counts.
+    #[test]
+    fn test_ot_extension_receiver_init_rejects_wrong_proof_count() {
+        let session_id = rng::get_rng().random::<[u8; crate::utilities::ID_LEN]>();
+        let (ot_sender, _) = OTEReceiver::init_phase1::<TestCurve>(&session_id);
+        let ot_receiver = OTReceiver::init();
+        let seed = ot_receiver.seed;
+        let (_, enc_proofs) = ot_receiver
+            .run_phase1_batch::<TestCurve>(&session_id, &vec![false; (KAPPA as usize) + 1])
+            .expect("base OT proof generation should succeed");
+
+        for proof_count in [0, (KAPPA as usize) - 1, (KAPPA as usize) + 1] {
+            let result = OTEReceiver::init_phase2::<TestCurve>(
+                &ot_sender,
+                &session_id,
+                &seed,
+                &enc_proofs[..proof_count],
+            );
+            let error = result.expect_err("wrong proof count should fail");
+            assert!(error
+                .description
+                .contains("Encryption proof vector has incorrect length"));
+        }
     }
 
     /// Tests if receiver-side OTE phase 1 rejects malformed choice bit lengths.
