@@ -210,13 +210,18 @@ impl<C: DklsCurve> MulSender<C> {
     ///
     /// # Errors
     ///
-    /// Will return `Err` if the underlying OT extension fails (see [`OTESender`](super::ot::extension::OTESender)).
+    /// Will return `Err` if `input` does not contain exactly [`L`] scalars or if the
+    /// underlying OT extension fails (see [`OTESender`](super::ot::extension::OTESender)).
     pub fn run(
         &self,
         session_id: &[u8],
         input: &[C::Scalar],
         data: &OTEDataToSender,
     ) -> Result<(Vec<C::Scalar>, MulDataToReceiver<C>), ErrorMul> {
+        if input.len() != L as usize {
+            return Err(ErrorMul::new("Input vector has incorrect length"));
+        }
+
         // RANDOMIZED MULTIPLICATION
 
         // Step 1 - No action for the sender.
@@ -798,6 +803,14 @@ mod tests {
         // and data_to_keep, and transmits data_to_sender.
 
         // Unique phase - Sender
+        for input_len in [0, L as usize - 1, L as usize + 1] {
+            let input = vec![Scalar::ZERO; input_len];
+            let error = mul_sender
+                .run(&session_id, &input, &data_to_sender)
+                .expect_err("incorrect multiplication input count should be rejected");
+            assert_eq!(error.description, "Input vector has incorrect length");
+        }
+
         let sender_result = mul_sender.run(&session_id, &sender_input, &data_to_sender);
 
         let sender_output: Vec<Scalar>;
