@@ -53,6 +53,7 @@ use crate::utilities::oracle_tags::{
 };
 use crate::utilities::rng;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// Error returned when the Fischlin proof-of-work search is exhausted
 /// without finding all required hash collisions.
@@ -114,15 +115,15 @@ impl<C: DklsCurve> InteractiveDLogProof<C> {
     #[must_use]
     pub fn prove_step1(mut rng: impl Rng) -> (C::Scalar, C::AffinePoint) {
         // We sample a nonzero random scalar.
-        let mut scalar_rand_commitment = <C::Scalar as Field>::ZERO;
-        while scalar_rand_commitment == <C::Scalar as Field>::ZERO {
-            scalar_rand_commitment = <C::Scalar as Field>::random(&mut rng);
+        let mut scalar_rand_commitment = Zeroizing::new(<C::Scalar as Field>::ZERO);
+        while *scalar_rand_commitment == <C::Scalar as Field>::ZERO {
+            *scalar_rand_commitment = <C::Scalar as Field>::random(&mut rng);
         }
 
         let generator = <C::AffinePoint as PrimeCurveAffine>::generator();
-        let point_rand_commitment = (generator * scalar_rand_commitment).to_affine();
+        let point_rand_commitment = (generator * *scalar_rand_commitment).to_affine();
 
-        (scalar_rand_commitment, point_rand_commitment)
+        (*scalar_rand_commitment, point_rand_commitment)
     }
 
     /// Step 2 - Computes the response for a given challenge.
@@ -226,7 +227,7 @@ impl<C: DklsCurve> DLogProof<C> {
     ) -> Result<DLogProof<C>, ProofSearchExhausted> {
         // We execute Step 1 r times.
         let mut rand_commitments: Vec<C::AffinePoint> = Vec::with_capacity(R as usize);
-        let mut states: Vec<C::Scalar> = Vec::with_capacity(R as usize);
+        let mut states: Zeroizing<Vec<C::Scalar>> = Zeroizing::new(Vec::with_capacity(R as usize));
         let mut rng = rng::get_rng();
         for _ in 0..R {
             let (state, rand_commitment) = InteractiveDLogProof::<C>::prove_step1(&mut rng);
@@ -274,22 +275,30 @@ impl<C: DklsCurve> DLogProof<C> {
                 // a lot of repetitions.
 
                 // We execute Step 2 at index i.
-                let first_proof = InteractiveDLogProof::<C>::prove_step2(
+                let InteractiveDLogProof {
+                    challenge: first_challenge,
+                    challenge_response: first_response,
+                    ..
+                } = InteractiveDLogProof::<C>::prove_step2(
                     scalar,
                     &states[i as usize],
                     &first_challenge,
                 );
+                let first_response = Zeroizing::new(first_response);
 
                 // Let's take the first hash here.
                 let generator = <C::AffinePoint as PrimeCurveAffine>::generator();
-                let first_msg = [
-                    &point_to_bytes::<C>(&generator),
-                    &rc_as_bytes[..],
-                    &i.to_be_bytes(),
-                    &first_challenge,
-                    &scalar_to_bytes::<C>(&first_proof.challenge_response),
-                ]
-                .concat();
+                let first_response_bytes = Zeroizing::new(scalar_to_bytes::<C>(&first_response));
+                let first_msg = Zeroizing::new(
+                    [
+                        &point_to_bytes::<C>(&generator),
+                        &rc_as_bytes[..],
+                        &i.to_be_bytes(),
+                        &first_challenge,
+                        &first_response_bytes,
+                    ]
+                    .concat(),
+                );
                 // The random oracle has to return an array of 2l bits = l/4 bytes, so we take a slice.
                 let first_hash = &tagged_hash(TAG_DLOG_PROOF_FISCHLIN, &[session_id, &first_msg])
                     [0..(L / 4) as usize];
@@ -304,22 +313,31 @@ impl<C: DklsCurve> DLogProof<C> {
                     //if used_second_challenges.contains(&second_challenge) { continue; }
 
                     // We execute Step 2 at index i + R/2.
-                    let second_proof = InteractiveDLogProof::<C>::prove_step2(
+                    let InteractiveDLogProof {
+                        challenge: second_challenge,
+                        challenge_response: second_response,
+                        ..
+                    } = InteractiveDLogProof::<C>::prove_step2(
                         scalar,
                         &states[(i + (R / 2)) as usize],
                         &second_challenge,
                     );
+                    let second_response = Zeroizing::new(second_response);
 
                     // Second hash now.
                     let generator = <C::AffinePoint as PrimeCurveAffine>::generator();
-                    let second_msg = [
-                        &point_to_bytes::<C>(&generator),
-                        &rc_as_bytes[..],
-                        &(i + (R / 2)).to_be_bytes(),
-                        &second_challenge,
-                        &scalar_to_bytes::<C>(&second_proof.challenge_response),
-                    ]
-                    .concat();
+                    let second_response_bytes =
+                        Zeroizing::new(scalar_to_bytes::<C>(&second_response));
+                    let second_msg = Zeroizing::new(
+                        [
+                            &point_to_bytes::<C>(&generator),
+                            &rc_as_bytes[..],
+                            &(i + (R / 2)).to_be_bytes(),
+                            &second_challenge,
+                            &second_response_bytes,
+                        ]
+                        .concat(),
+                    );
                     let second_hash =
                         &tagged_hash(TAG_DLOG_PROOF_FISCHLIN, &[session_id, &second_msg])
                             [0..(L / 4) as usize];
@@ -327,8 +345,16 @@ impl<C: DklsCurve> DLogProof<C> {
                     // If the hashes are equal, we are successful and we can break both loops.
                     if *first_hash == *second_hash {
                         // We save the successful results.
-                        first_proofs.push(first_proof);
-                        last_proofs.push(second_proof);
+                        first_proofs.push(InteractiveDLogProof {
+                            challenge: first_challenge,
+                            challenge_response: *first_response,
+                            _curve: PhantomData,
+                        });
+                        last_proofs.push(InteractiveDLogProof {
+                            challenge: second_challenge,
+                            challenge_response: *second_response,
+                            _curve: PhantomData,
+                        });
 
                         // We update the flag to break the outer loop.
                         flag = true;
@@ -595,20 +621,20 @@ impl<C: DklsCurve> CPProof<C> {
         base_h: &C::AffinePoint,
     ) -> (C::Scalar, RandomCommitments<C>) {
         // We sample a nonzero random scalar.
-        let mut scalar_rand_commitment = <C::Scalar as Field>::ZERO;
-        while scalar_rand_commitment == <C::Scalar as Field>::ZERO {
-            scalar_rand_commitment = <C::Scalar as Field>::random(&mut rng::get_rng());
+        let mut scalar_rand_commitment = Zeroizing::new(<C::Scalar as Field>::ZERO);
+        while *scalar_rand_commitment == <C::Scalar as Field>::ZERO {
+            *scalar_rand_commitment = <C::Scalar as Field>::random(&mut rng::get_rng());
         }
 
-        let point_rand_commitment_g = (*base_g * scalar_rand_commitment).to_affine();
-        let point_rand_commitment_h = (*base_h * scalar_rand_commitment).to_affine();
+        let point_rand_commitment_g = (*base_g * *scalar_rand_commitment).to_affine();
+        let point_rand_commitment_h = (*base_h * *scalar_rand_commitment).to_affine();
 
         let rand_commitments = RandomCommitments {
             rc_g: point_rand_commitment_g,
             rc_h: point_rand_commitment_h,
         };
 
-        (scalar_rand_commitment, rand_commitments)
+        (*scalar_rand_commitment, rand_commitments)
     }
 
     /// Step 2 - Compute the response for a given challenge.
@@ -778,6 +804,7 @@ impl<C: DklsCurve> EncProof<C> {
 
         // Commitments for real proof.
         let (real_scalar_commitment, real_commitments) = CPProof::prove_step1(&base_g, base_h);
+        let real_scalar_commitment = Zeroizing::new(real_scalar_commitment);
 
         // Fake proof.
         let (fake_commitments, fake_challenge, fake_proof) =
@@ -848,7 +875,7 @@ impl<C: DklsCurve> EncProof<C> {
             &base_g,
             base_h,
             scalar,
-            &real_scalar_commitment,
+            &*real_scalar_commitment,
             &real_challenge,
         );
 

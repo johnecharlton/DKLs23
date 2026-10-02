@@ -42,7 +42,7 @@ use serde::de::Error;
 #[cfg(feature = "serde")]
 use serde::{Deserializer, Serializer};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::curve::DklsCurve;
 use crate::{RAW_SECURITY, STAT_SECURITY};
@@ -87,8 +87,11 @@ pub fn serialize_vec_prg<S>(data: &[[u8; PRG_DATA_SIZE]], serializer: S) -> Resu
 where
     S: Serializer,
 {
-    let concatenated: Vec<u8> = data.iter().flat_map(|&b| b.to_vec()).collect();
-    serde_bytes::Serialize::serialize(&concatenated, serializer)
+    let mut concatenated = Zeroizing::new(Vec::with_capacity(data.len() * PRG_DATA_SIZE));
+    for row in data {
+        concatenated.extend_from_slice(row);
+    }
+    serde_bytes::Serialize::serialize(&*concatenated, serializer)
 }
 
 #[cfg(feature = "serde")]
@@ -96,15 +99,14 @@ pub fn deserialize_vec_prg<'de, D>(deserializer: D) -> Result<Vec<[u8; PRG_DATA_
 where
     D: Deserializer<'de>,
 {
-    let concatenated: Vec<u8> = serde_bytes::Deserialize::deserialize(deserializer)?;
-
-    concatenated
-        .chunks(PRG_DATA_SIZE)
-        .map(|chunk| {
-            let array: [u8; PRG_DATA_SIZE] = chunk.try_into().map_err(D::Error::custom)?;
-            Ok(array)
-        })
-        .collect()
+    let concatenated: Zeroizing<Vec<u8>> =
+        Zeroizing::new(serde_bytes::Deserialize::deserialize(deserializer)?);
+    let mut decoded: Zeroizing<Vec<[u8; PRG_DATA_SIZE]>> =
+        Zeroizing::new(Vec::with_capacity(concatenated.len() / PRG_DATA_SIZE));
+    for chunk in concatenated.chunks(PRG_DATA_SIZE) {
+        decoded.push(chunk.try_into().map_err(D::Error::custom)?);
+    }
+    Ok(std::mem::take(&mut *decoded))
 }
 
 /// Sender's data and methods for the OTE protocol.
@@ -161,7 +163,8 @@ impl OTESender {
         let ot_receiver = OTReceiver::init();
 
         // The choice bits are sampled randomly.
-        let mut correlation: Vec<bool> = Vec::with_capacity(KAPPA as usize);
+        let mut correlation: Zeroizing<Vec<bool>> =
+            Zeroizing::new(Vec::with_capacity(KAPPA as usize));
         for _ in 0..KAPPA {
             correlation.push(rng::get_rng().random());
         }
@@ -171,7 +174,12 @@ impl OTESender {
             .run_phase1_batch::<C>(session_id, &correlation)
             .expect("KAPPA is a u16 constant and always fits");
 
-        (ot_receiver, correlation, vec_r, enc_proofs)
+        (
+            ot_receiver,
+            std::mem::take(&mut *correlation),
+            vec_r,
+            enc_proofs,
+        )
     }
 
     /// Finishes the initialization.
@@ -190,10 +198,15 @@ impl OTESender {
         vec_r: &[C::Scalar],
         dlog_proof: &DLogProof<C>,
     ) -> Result<OTESender, ErrorOT> {
+        let mut correlation = Zeroizing::new(correlation);
+
         // The outputs from the base OT become the sender's seeds.
         let seeds = ot_receiver.run_phase2_batch::<C>(session_id, vec_r, dlog_proof)?;
 
-        Ok(OTESender { correlation, seeds })
+        Ok(OTESender {
+            correlation: std::mem::take(&mut *correlation),
+            seeds,
+        })
     }
 
     // PROTOCOL
@@ -252,9 +265,11 @@ impl OTESender {
 
         // Step 2 - Extend the seed with the pseudorandom generator (PRG).
         // The PRG will be implemented via hash functions.
-        let mut extended_seeds: Vec<PRGOutput> = Vec::with_capacity(KAPPA as usize);
+        let mut extended_seeds: Zeroizing<Vec<PRGOutput>> =
+            Zeroizing::new(Vec::with_capacity(KAPPA as usize));
         for i in 0..KAPPA {
-            let mut prg: Vec<u8> = Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize); //It may use more capacity.
+            let mut prg: Zeroizing<Vec<u8>> =
+                Zeroizing::new(Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize));
 
             // The PRG will given by concatenating "chunks" of hash outputs.
             // The reason for this is that we need more than 256 bits.
@@ -263,15 +278,16 @@ impl OTESender {
                 let i_bytes = i.to_be_bytes();
                 let count_bytes = count.to_be_bytes();
                 count += 1;
-                let chunk = tagged_hash(
+                let chunk = Zeroizing::new(tagged_hash(
                     TAG_OTE_PRG,
                     &[session_id, &i_bytes, &count_bytes, &self.seeds[i as usize]],
-                );
+                ));
 
-                prg.extend_from_slice(&chunk);
+                let remaining = ((EXTENDED_BATCH_SIZE / 8) as usize) - prg.len();
+                prg.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
             }
 
-            // We remove extra bytes
+            // We copy the PRG output.
             let mut prg_output = [0; (EXTENDED_BATCH_SIZE / 8) as usize];
             prg_output.clone_from_slice(&prg[0..(EXTENDED_BATCH_SIZE / 8) as usize]);
 
@@ -282,7 +298,7 @@ impl OTESender {
 
         // Step 4 - Compute the q from Fig. 10 in KOS.
         // It is computed with the matrix u sent by the receiver.
-        let mut q: Vec<PRGOutput> = Vec::with_capacity(KAPPA as usize);
+        let mut q: Zeroizing<Vec<PRGOutput>> = Zeroizing::new(Vec::with_capacity(KAPPA as usize));
         for i in 0..KAPPA {
             let mut q_i = [0; (EXTENDED_BATCH_SIZE / 8) as usize];
             for j in 0..EXTENDED_BATCH_SIZE / 8 {
@@ -322,14 +338,18 @@ impl OTESender {
 
         // Step 3 - Verify the values sent by the receiver against our data.
         // We start by computing the verifying vector q (as in KOS, Fig. 10).
-        let mut verify_q: Vec<FieldElement> = Vec::with_capacity(KAPPA as usize);
+        let mut verify_q: Zeroizing<Vec<FieldElement>> =
+            Zeroizing::new(Vec::with_capacity(KAPPA as usize));
         for i in 0..KAPPA {
             // The summation sign on the protocol is just the sum of the following two terms:
-            let prod_qi_1 = field_mul(&q[i as usize][0..(OT_SECURITY / 8) as usize], &chi1)?;
-            let prod_qi_2 = field_mul(
+            let prod_qi_1 = Zeroizing::new(field_mul(
+                &q[i as usize][0..(OT_SECURITY / 8) as usize],
+                &chi1,
+            )?);
+            let prod_qi_2 = Zeroizing::new(field_mul(
                 &q[i as usize][((OT_SECURITY / 8) as usize)..((2 * OT_SECURITY / 8) as usize)],
                 &chi2,
-            )?;
+            )?);
 
             //We sum the terms to get q_i.
             let mut verify_qi = [0u8; (OT_SECURITY / 8) as usize];
@@ -343,7 +363,8 @@ impl OTESender {
         }
 
         // We compute the same thing with the receiver's information.
-        let mut verify_sender: Vec<FieldElement> = Vec::with_capacity(KAPPA as usize);
+        let mut verify_sender: Zeroizing<Vec<FieldElement>> =
+            Zeroizing::new(Vec::with_capacity(KAPPA as usize));
         for i in 0..KAPPA {
             let mut verify_sender_i = [0u8; (OT_SECURITY / 8) as usize];
             for k in 0..OT_SECURITY / 8 {
@@ -369,7 +390,7 @@ impl OTESender {
         // TRANSPOSE AND RANDOMIZE
 
         // Step 1 - We compute the transpose of q and take the first BATCH_SIZE rows.
-        let transposed_q = cut_and_transpose(&q)?;
+        let transposed_q = Zeroizing::new(cut_and_transpose(&q)?);
 
         // Step 2 - No action for the sender.
 
@@ -386,7 +407,8 @@ impl OTESender {
 
         // For convenience, we write the correlation in "compressed form" as an array of u8.
         // We interpreted the correlation as a little-endian representation of a number.
-        let mut compressed_correlation: Vec<u8> = Vec::with_capacity((KAPPA / 8) as usize);
+        let mut compressed_correlation: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity((KAPPA / 8) as usize));
         for i in 0..KAPPA / 8 {
             compressed_correlation.push(
                 u8::from(self.correlation[(i * 8) as usize])
@@ -401,13 +423,16 @@ impl OTESender {
         }
 
         let mut vector_of_v0: Vec<Vec<C::Scalar>> = Vec::with_capacity(ot_width as usize);
-        let mut vector_of_v1: Vec<Vec<C::Scalar>> = Vec::with_capacity(ot_width as usize);
+        let mut vector_of_v1: Zeroizing<Vec<Vec<C::Scalar>>> =
+            Zeroizing::new(Vec::with_capacity(ot_width as usize));
         for iteration in 0..ot_width {
             let mut v0: Vec<C::Scalar> = Vec::with_capacity(BATCH_SIZE as usize);
-            let mut v1: Vec<C::Scalar> = Vec::with_capacity(BATCH_SIZE as usize);
+            let mut v1: Zeroizing<Vec<C::Scalar>> =
+                Zeroizing::new(Vec::with_capacity(BATCH_SIZE as usize));
             for j in 0..BATCH_SIZE {
                 // For v1, we compute transposed_q[j] ^ correlation.
-                let mut transposed_qj_plus_correlation = [0u8; (KAPPA / 8) as usize];
+                let mut transposed_qj_plus_correlation =
+                    Zeroizing::new([0u8; (KAPPA / 8) as usize]);
                 for i in 0..KAPPA / 8 {
                     transposed_qj_plus_correlation[i as usize] =
                         transposed_q[j as usize][i as usize] ^ compressed_correlation[i as usize];
@@ -431,13 +456,13 @@ impl OTESender {
                         session_id,
                         &j_bytes,
                         &iteration_bytes,
-                        &transposed_qj_plus_correlation,
+                        &*transposed_qj_plus_correlation,
                     ],
                 ));
             }
 
             vector_of_v0.push(v0);
-            vector_of_v1.push(v1);
+            vector_of_v1.push(std::mem::take(&mut *v1));
         }
 
         // TRANSFER
@@ -549,16 +574,17 @@ impl OTEReceiver {
         // EXTEND
 
         // Step 1 - Extend the choice bits by adding random noise.
-        let mut random_choice_bits: Vec<bool> = Vec::with_capacity(OT_SECURITY as usize);
+        let mut random_choice_bits: Zeroizing<Vec<bool>> =
+            Zeroizing::new(Vec::with_capacity(OT_SECURITY as usize));
         for _ in 0..OT_SECURITY {
             random_choice_bits.push(rng::get_rng().random());
         }
-        let extended_choice_bits = [choice_bits, &random_choice_bits].concat();
+        let extended_choice_bits = Zeroizing::new([choice_bits, &random_choice_bits].concat());
 
         // For convenience, we also keep the choice bits in "compressed form" as an array of u8.
         // We interpreted extended_choice_bits as a little-endian representation of a number.
-        let mut compressed_extended_bits: Vec<u8> =
-            Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize);
+        let mut compressed_extended_bits: Zeroizing<Vec<u8>> =
+            Zeroizing::new(Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize));
         for i in 0..EXTENDED_BATCH_SIZE / 8 {
             compressed_extended_bits.push(
                 u8::from(extended_choice_bits[(i * 8) as usize])
@@ -574,11 +600,15 @@ impl OTEReceiver {
 
         // Step 2 - Extend the seeds with the pseudorandom generator (PRG).
         // The PRG will be implemented via hash functions.
-        let mut extended_seeds0: Vec<PRGOutput> = Vec::with_capacity(KAPPA as usize);
-        let mut extended_seeds1: Vec<PRGOutput> = Vec::with_capacity(KAPPA as usize);
+        let mut extended_seeds0: Zeroizing<Vec<PRGOutput>> =
+            Zeroizing::new(Vec::with_capacity(KAPPA as usize));
+        let mut extended_seeds1: Zeroizing<Vec<PRGOutput>> =
+            Zeroizing::new(Vec::with_capacity(KAPPA as usize));
         for i in 0..KAPPA {
-            let mut prg0: Vec<u8> = Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize); //It may use more capacity.
-            let mut prg1: Vec<u8> = Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize);
+            let mut prg0: Zeroizing<Vec<u8>> =
+                Zeroizing::new(Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize));
+            let mut prg1: Zeroizing<Vec<u8>> =
+                Zeroizing::new(Vec::with_capacity((EXTENDED_BATCH_SIZE / 8) as usize));
 
             // The PRG will given by concatenating "chunks" of hash outputs.
             // The reason for this is that we need more than 256 bits.
@@ -587,20 +617,21 @@ impl OTEReceiver {
                 let i_bytes = i.to_be_bytes();
                 let count_bytes = count.to_be_bytes();
                 count += 1;
-                let chunk0 = tagged_hash(
+                let chunk0 = Zeroizing::new(tagged_hash(
                     TAG_OTE_PRG,
                     &[session_id, &i_bytes, &count_bytes, &self.seeds0[i as usize]],
-                );
-                let chunk1 = tagged_hash(
+                ));
+                let chunk1 = Zeroizing::new(tagged_hash(
                     TAG_OTE_PRG,
                     &[session_id, &i_bytes, &count_bytes, &self.seeds1[i as usize]],
-                );
+                ));
 
-                prg0.extend_from_slice(&chunk0);
-                prg1.extend_from_slice(&chunk1);
+                let remaining = ((EXTENDED_BATCH_SIZE / 8) as usize) - prg0.len();
+                prg0.extend_from_slice(&chunk0[..remaining.min(chunk0.len())]);
+                prg1.extend_from_slice(&chunk1[..remaining.min(chunk1.len())]);
             }
 
-            // We remove extra bytes
+            // We copy the PRG output.
             let mut prg0_output = [0; (EXTENDED_BATCH_SIZE / 8) as usize];
             let mut prg1_output = [0; (EXTENDED_BATCH_SIZE / 8) as usize];
             prg0_output.clone_from_slice(&prg0[0..(EXTENDED_BATCH_SIZE / 8) as usize]);
@@ -652,15 +683,15 @@ impl OTEReceiver {
 
         // Step 2 - We compute the verification values to the sender.
         // The summation sign on the protocol is just the sum of the following two terms:
-        let prod_x_1 = field_mul(
+        let prod_x_1 = Zeroizing::new(field_mul(
             &compressed_extended_bits[0..(OT_SECURITY / 8) as usize],
             &chi1,
-        )?;
-        let prod_x_2 = field_mul(
+        )?);
+        let prod_x_2 = Zeroizing::new(field_mul(
             &compressed_extended_bits
                 [((OT_SECURITY / 8) as usize)..((2 * OT_SECURITY / 8) as usize)],
             &chi2,
-        )?;
+        )?);
 
         // We sum the terms to get x.
         let mut verify_x = [0u8; (OT_SECURITY / 8) as usize];
@@ -673,15 +704,15 @@ impl OTEReceiver {
         let mut verify_t: Vec<FieldElement> = Vec::with_capacity(KAPPA as usize);
         for i in 0..KAPPA {
             // The summation sign on the protocol is just the sum of the following two terms:
-            let prod_ti_1 = field_mul(
+            let prod_ti_1 = Zeroizing::new(field_mul(
                 &extended_seeds0[i as usize][0..(OT_SECURITY / 8) as usize],
                 &chi1,
-            )?;
-            let prod_ti_2 = field_mul(
+            )?);
+            let prod_ti_2 = Zeroizing::new(field_mul(
                 &extended_seeds0[i as usize]
                     [((OT_SECURITY / 8) as usize)..((2 * OT_SECURITY / 8) as usize)],
                 &chi2,
-            )?;
+            )?);
 
             //We sum the terms to get t_i.
             let mut verify_ti = [0u8; (OT_SECURITY / 8) as usize];
@@ -704,7 +735,7 @@ impl OTEReceiver {
         };
 
         // extended_seeds0 has to be kept for the next phase.
-        Ok((extended_seeds0, data_to_sender))
+        Ok((std::mem::take(&mut *extended_seeds0), data_to_sender))
     }
 
     /// Finishes the receiver's protocol and gives his output.
@@ -753,15 +784,17 @@ impl OTEReceiver {
         // TRANSPOSE AND RANDOMIZE
 
         // Step 1 - We compute the transpose of extended_seeds and take the first BATCH_SIZE rows.
-        let transposed_t = cut_and_transpose(extended_seeds)?;
+        let transposed_t = Zeroizing::new(cut_and_transpose(extended_seeds)?);
 
         // Step 2 - We compute the final message. For the final part, it will be better
         // if we compute it in the form of a scalar.
 
         // As stated for the sender, we run this part ot_width times with varying salts.
-        let mut vector_of_v: Vec<Vec<C::Scalar>> = Vec::with_capacity(ot_width as usize);
+        let mut vector_of_v: Zeroizing<Vec<Vec<C::Scalar>>> =
+            Zeroizing::new(Vec::with_capacity(ot_width as usize));
         for iteration in 0..ot_width {
-            let mut v: Vec<C::Scalar> = Vec::with_capacity(BATCH_SIZE as usize);
+            let mut v: Zeroizing<Vec<C::Scalar>> =
+                Zeroizing::new(Vec::with_capacity(BATCH_SIZE as usize));
             for j in 0..BATCH_SIZE {
                 let j_bytes = j.to_be_bytes();
                 let iteration_bytes = iteration.to_be_bytes();
@@ -776,7 +809,7 @@ impl OTEReceiver {
                 ));
             }
 
-            vector_of_v.push(v);
+            vector_of_v.push(std::mem::take(&mut *v));
         }
 
         // Step 3 - No action for the receiver.
@@ -895,9 +928,9 @@ pub fn field_mul(left: &[u8], right: &[u8]) -> Result<FieldElement, ErrorOT> {
         ));
     }
 
-    let mut a = [0u64; T as usize];
-    let mut b = [0u64; (T + 1) as usize]; //b has extra space because it will be shifted.
-    let mut c = [0u64; (2 * T) as usize];
+    let mut a = Zeroizing::new([0u64; T as usize]);
+    let mut b = Zeroizing::new([0u64; (T + 1) as usize]); //b has extra space because it will be shifted.
+    let mut c = Zeroizing::new([0u64; (2 * T) as usize]);
 
     // Conversion of [u8; 26] to [u64; 4].
     for i in 0..OT_SECURITY / 8 {
@@ -1442,5 +1475,22 @@ mod tests {
         );
         let error = result.expect_err("tampered verify_t should fail");
         assert!(error.description.contains("Receiver cheated in OTE"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_prg_serialization_preserves_flat_bytes() {
+        let rows = vec![[7u8; PRG_DATA_SIZE], [9u8; PRG_DATA_SIZE]];
+        let encoded = serialize_vec_prg(&rows, serde_json::value::Serializer).unwrap();
+        let bytes = [vec![7u8; PRG_DATA_SIZE], vec![9u8; PRG_DATA_SIZE]].concat();
+        assert_eq!(encoded, serde_json::to_value(bytes).unwrap());
+        assert_eq!(deserialize_vec_prg(encoded).unwrap(), rows);
+        assert!(deserialize_vec_prg(serde_json::json!([]))
+            .unwrap()
+            .is_empty());
+        assert!(
+            deserialize_vec_prg(serde_json::to_value(vec![7u8; PRG_DATA_SIZE + 1]).unwrap())
+                .is_err()
+        );
     }
 }

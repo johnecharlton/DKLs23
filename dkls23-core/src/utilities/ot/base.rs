@@ -20,6 +20,7 @@ use rand::RngExt;
 use rustcrypto_ff::Field;
 use rustcrypto_group::prime::PrimeCurveAffine;
 use rustcrypto_group::Curve as GroupCurve;
+use zeroize::Zeroizing;
 
 use crate::curve::DklsCurve;
 use crate::utilities::hashes::{point_to_bytes, tagged_hash, tagged_hash_as_scalar, HashOutput};
@@ -72,15 +73,15 @@ impl<C: DklsCurve> OTSender<C> {
     #[must_use]
     pub fn init(session_id: &[u8]) -> OTSender<C> {
         // We sample a nonzero random scalar.
-        let mut s = <C::Scalar as Field>::ZERO;
-        while s == <C::Scalar as Field>::ZERO {
-            s = <C::Scalar as Field>::random(&mut rng::get_rng());
+        let mut s = Zeroizing::new(<C::Scalar as Field>::ZERO);
+        while *s == <C::Scalar as Field>::ZERO {
+            *s = <C::Scalar as Field>::random(&mut rng::get_rng());
         }
 
         let proof = DLogProof::<C>::prove(&s, session_id)
             .expect("Fischlin proof-of-work search exhausted — RNG failure");
 
-        OTSender { s, proof }
+        OTSender { s: *s, proof }
     }
 
     // Phase 1 - The sender transmits z = s * generator and the proof
@@ -131,12 +132,12 @@ impl<C: DklsCurve> OTSender<C> {
 
         let (_, v) = enc_proof.get_u_and_v();
 
-        let value_for_m0 = (v * self.s).to_affine();
+        let value_for_m0 = Zeroizing::new((v * self.s).to_affine());
         let value_for_m1 = (C::ProjectivePoint::from(v) - C::ProjectivePoint::from(h)).to_affine();
-        let value_for_m1 = (value_for_m1 * self.s).to_affine();
+        let value_for_m1 = Zeroizing::new((value_for_m1 * self.s).to_affine());
 
-        let value_for_m0_bytes = point_to_bytes::<C>(&value_for_m0);
-        let value_for_m1_bytes = point_to_bytes::<C>(&value_for_m1);
+        let value_for_m0_bytes = Zeroizing::new(point_to_bytes::<C>(&value_for_m0));
+        let value_for_m1_bytes = Zeroizing::new(point_to_bytes::<C>(&value_for_m1));
 
         let m0 = tagged_hash(TAG_OT_BASE_MSG, &[session_id, &value_for_m0_bytes]);
         let m1 = tagged_hash(TAG_OT_BASE_MSG, &[session_id, &value_for_m1_bytes]);
@@ -160,8 +161,10 @@ impl<C: DklsCurve> OTSender<C> {
         let batch_size = u16::try_from(enc_proofs.len())
             .map_err(|_| ErrorOT::new("Batch size exceeds maximum (65535)"))?;
 
-        let mut vec_m0: Vec<HashOutput> = Vec::with_capacity(batch_size as usize);
-        let mut vec_m1: Vec<HashOutput> = Vec::with_capacity(batch_size as usize);
+        let mut vec_m0: Zeroizing<Vec<HashOutput>> =
+            Zeroizing::new(Vec::with_capacity(batch_size as usize));
+        let mut vec_m1: Zeroizing<Vec<HashOutput>> =
+            Zeroizing::new(Vec::with_capacity(batch_size as usize));
         for i in 0..batch_size {
             // We use different ids for different iterations.
             let current_sid = [&i.to_be_bytes(), session_id].concat();
@@ -172,7 +175,7 @@ impl<C: DklsCurve> OTSender<C> {
             vec_m1.push(m1);
         }
 
-        Ok((vec_m0, vec_m1))
+        Ok((std::mem::take(&mut *vec_m0), std::mem::take(&mut *vec_m1)))
     }
 }
 
@@ -200,7 +203,7 @@ impl OTReceiver {
         bit: bool,
     ) -> (C::Scalar, EncProof<C>) {
         // We sample the secret scalar r.
-        let r = <C::Scalar as Field>::random(&mut rng::get_rng());
+        let r = Zeroizing::new(<C::Scalar as Field>::random(&mut rng::get_rng()));
 
         // We compute h as in the paper.
         let generator = <C::AffinePoint as PrimeCurveAffine>::generator();
@@ -211,7 +214,7 @@ impl OTReceiver {
         let proof = EncProof::<C>::prove(session_id, &h, &r, bit);
 
         // r should be kept and proof should be sent.
-        (r, proof)
+        (*r, proof)
     }
 
     // Phase 1 batch version: used for multiple executions (e.g. OT extension).
@@ -229,7 +232,8 @@ impl OTReceiver {
         let batch_size = u16::try_from(bits.len())
             .map_err(|_| ErrorOT::new("Batch size exceeds maximum (65535)"))?;
 
-        let mut vec_r: Vec<C::Scalar> = Vec::with_capacity(batch_size as usize);
+        let mut vec_r: Zeroizing<Vec<C::Scalar>> =
+            Zeroizing::new(Vec::with_capacity(batch_size as usize));
         let mut vec_proof: Vec<EncProof<C>> = Vec::with_capacity(batch_size as usize);
         for i in 0..batch_size {
             // We use different ids for different iterations.
@@ -241,7 +245,7 @@ impl OTReceiver {
             vec_proof.push(proof);
         }
 
-        Ok((vec_r, vec_proof))
+        Ok((std::mem::take(&mut *vec_r), vec_proof))
     }
 
     // Communication round
@@ -289,8 +293,8 @@ impl OTReceiver {
     ) -> HashOutput {
         // We compute the message.
 
-        let value_for_mb = (*z * r).to_affine();
-        let value_for_mb_bytes = point_to_bytes::<C>(&value_for_mb);
+        let value_for_mb = Zeroizing::new((*z * r).to_affine());
+        let value_for_mb_bytes = Zeroizing::new(point_to_bytes::<C>(&value_for_mb));
 
         // We could return the bit as in the paper, but the receiver has this information.
         tagged_hash(TAG_OT_BASE_MSG, &[session_id, &value_for_mb_bytes])
@@ -317,7 +321,8 @@ impl OTReceiver {
         let batch_size = u16::try_from(vec_r.len())
             .map_err(|_| ErrorOT::new("Batch size exceeds maximum (65535)"))?;
 
-        let mut vec_mb: Vec<HashOutput> = Vec::with_capacity(batch_size as usize);
+        let mut vec_mb: Zeroizing<Vec<HashOutput>> =
+            Zeroizing::new(Vec::with_capacity(batch_size as usize));
         for i in 0..batch_size {
             // We use different ids for different iterations.
             let current_sid = [&i.to_be_bytes(), session_id].concat();
@@ -327,7 +332,7 @@ impl OTReceiver {
             vec_mb.push(mb);
         }
 
-        Ok(vec_mb)
+        Ok(std::mem::take(&mut *vec_mb))
     }
 }
 

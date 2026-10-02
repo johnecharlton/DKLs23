@@ -58,6 +58,7 @@ use rustcrypto_group::prime::PrimeCurveAffine;
 use rustcrypto_group::Curve as GroupCurve;
 
 use rand::RngExt;
+use zeroize::Zeroizing;
 
 use crate::curve::DklsCurve;
 use crate::protocols::derivation::{ChainCode, DerivData, CHAIN_CODE_LEN};
@@ -268,11 +269,12 @@ mod message_tags {
 pub(crate) fn step1<C: DklsCurve>(parameters: &Parameters) -> Vec<C::Scalar> {
     // We represent the polynomial by its coefficients.
     let mut rng = rng::get_rng(); // Reuse RNG
-    let mut polynomial: Vec<C::Scalar> = Vec::with_capacity(parameters.threshold as usize);
+    let mut polynomial: Zeroizing<Vec<C::Scalar>> =
+        Zeroizing::new(Vec::with_capacity(parameters.threshold as usize));
     for _ in 0..parameters.threshold {
         polynomial.push(<C::Scalar as Field>::random(&mut rng)); // Pass the RNG explicitly
     }
-    polynomial
+    std::mem::take(&mut *polynomial)
 }
 
 /// Evaluates the polynomial from the previous step at every point.
@@ -459,7 +461,7 @@ pub(crate) fn step5<C: DklsCurve>(
 #[must_use]
 pub fn phase1<C: DklsCurve>(data: &SessionData) -> Vec<C::Scalar> {
     // DKG
-    let secret_polynomial = step1::<C>(&data.parameters);
+    let secret_polynomial = Zeroizing::new(step1::<C>(&data.parameters));
 
     step2::<C>(&data.parameters, &secret_polynomial)
 }

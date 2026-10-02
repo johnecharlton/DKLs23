@@ -10,7 +10,7 @@
 use rustcrypto_ff::Field;
 use std::marker::PhantomData;
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::curve::DklsCurve;
 use crate::utilities::hashes::{scalar_to_bytes, tagged_hash, tagged_hash_as_scalar, HashOutput};
@@ -225,8 +225,8 @@ impl<C: DklsCurve> MulSender<C> {
         // We also set the correlation for the OT protocol.
 
         // There are L pads and L check_values.
-        let mut a_tilde: Vec<C::Scalar> = Vec::with_capacity(L as usize);
-        let mut a_hat: Vec<C::Scalar> = Vec::with_capacity(L as usize);
+        let mut a_tilde: Zeroizing<Vec<C::Scalar>> = Zeroizing::new(Vec::with_capacity(L as usize));
+        let mut a_hat: Zeroizing<Vec<C::Scalar>> = Zeroizing::new(Vec::with_capacity(L as usize));
         for _ in 0..L {
             a_tilde.push(<C::Scalar as Field>::random(&mut rng::get_rng()));
             a_hat.push(<C::Scalar as Field>::random(&mut rng::get_rng()));
@@ -242,8 +242,10 @@ impl<C: DklsCurve> MulSender<C> {
         // Now, by DKLs23, we hardcoded l = 1 in DKLs19. At the same time,
         // DKLs23 has its parameter L. To adapt the old protocol, we repeat
         // Step 2 in DKLs19 L times, so in the end we get 2*L correlations.
-        let mut correlation_tilde: Vec<Vec<C::Scalar>> = Vec::with_capacity(L as usize);
-        let mut correlation_hat: Vec<Vec<C::Scalar>> = Vec::with_capacity(L as usize);
+        let mut correlation_tilde: Zeroizing<Vec<Vec<C::Scalar>>> =
+            Zeroizing::new(Vec::with_capacity(OT_WIDTH as usize));
+        let mut correlation_hat: Zeroizing<Vec<Vec<C::Scalar>>> =
+            Zeroizing::new(Vec::with_capacity(L as usize));
         for i in 0..L {
             let correlation_tilde_i = vec![a_tilde[i as usize]; BATCH_SIZE as usize];
             let correlation_hat_i = vec![a_hat[i as usize]; BATCH_SIZE as usize];
@@ -253,7 +255,8 @@ impl<C: DklsCurve> MulSender<C> {
         }
 
         // We gather the correlations.
-        let correlations = [correlation_tilde, correlation_hat].concat();
+        correlation_tilde.append(&mut correlation_hat);
+        let correlations = correlation_tilde;
 
         // Step 3 - We execute the OT protocol.
 
@@ -275,11 +278,11 @@ impl<C: DklsCurve> MulSender<C> {
             .ote_sender
             .run::<C>(&ote_sid, OT_WIDTH, &correlations, data);
 
-        let ot_outputs: Vec<Vec<C::Scalar>>;
+        let ot_outputs: Zeroizing<Vec<Vec<C::Scalar>>>;
         let vector_of_tau: Vec<Vec<C::Scalar>>; // Used by the receiver to finish the OT protocol.
         match result {
             Ok((out, tau)) => {
-                (ot_outputs, vector_of_tau) = (out, tau);
+                (ot_outputs, vector_of_tau) = (Zeroizing::new(out), tau);
             }
             Err(error) => {
                 return Err(ErrorMul::new(&format!(
@@ -325,11 +328,13 @@ impl<C: DklsCurve> MulSender<C> {
         // Only a hash of r will be sent to the receiver,
         // so we'll compute r directly in bytes.
         // The variable below saves each row of r in bytes.
-        let mut rows_r_as_bytes: Vec<Vec<u8>> = Vec::with_capacity(L as usize);
+        let mut rows_r_as_bytes: Zeroizing<Vec<Vec<u8>>> =
+            Zeroizing::new(Vec::with_capacity(L as usize));
         let mut verify_u: Vec<C::Scalar> = Vec::with_capacity(L as usize);
         for i in 0..L {
             // We compute the i-th row of the matrix r in bytes.
-            let mut entries_as_bytes: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE as usize);
+            let mut entries_as_bytes: Zeroizing<Vec<Vec<u8>>> =
+                Zeroizing::new(Vec::with_capacity(BATCH_SIZE as usize));
             for j in 0..BATCH_SIZE {
                 let entry = (chi_tilde[i as usize] * z_tilde[i as usize][j as usize])
                     + (chi_hat[i as usize] * z_hat[i as usize][j as usize]);
@@ -344,7 +349,7 @@ impl<C: DklsCurve> MulSender<C> {
                 + (chi_hat[i as usize] * a_hat[i as usize]);
             verify_u.push(entry);
         }
-        let r_as_bytes = rows_r_as_bytes.concat();
+        let r_as_bytes = Zeroizing::new(rows_r_as_bytes.concat());
 
         // We transform r into a hash.
         let verify_r: HashOutput = tagged_hash(TAG_MUL_VERIFY, &[session_id, &r_as_bytes]);
@@ -483,7 +488,8 @@ impl<C: DklsCurve> MulReceiver<C> {
         // number b that the receiver inputs into the protocol. Hence, we
         // will denote b_tilde simply as b.
 
-        let mut choice_bits: Vec<bool> = Vec::with_capacity(BATCH_SIZE as usize);
+        let mut choice_bits: Zeroizing<Vec<bool>> =
+            Zeroizing::new(Vec::with_capacity(BATCH_SIZE as usize));
         let mut b = <C::Scalar as Field>::ZERO;
         for i in 0..BATCH_SIZE {
             let current_bit: bool = rng::get_rng().random();
@@ -513,6 +519,8 @@ impl<C: DklsCurve> MulReceiver<C> {
                     )));
                 }
             };
+
+        let mut extended_seeds = Zeroizing::new(extended_seeds);
 
         // Step 4 - We compute the shared random values.
 
@@ -546,8 +554,8 @@ impl<C: DklsCurve> MulReceiver<C> {
 
         let data_to_keep = MulDataToKeepReceiver {
             b,
-            choice_bits,
-            extended_seeds,
+            choice_bits: std::mem::take(&mut *choice_bits),
+            extended_seeds: std::mem::take(&mut *extended_seeds),
             chi_tilde,
             chi_hat,
             _curve: PhantomData,
@@ -594,8 +602,8 @@ impl<C: DklsCurve> MulReceiver<C> {
             &data_received.vector_of_tau,
         );
 
-        let ot_outputs: Vec<Vec<C::Scalar>> = match result {
-            Ok(out) => out,
+        let ot_outputs = match result {
+            Ok(out) => Zeroizing::new(out),
             Err(error) => {
                 return Err(ErrorMul::new(&format!(
                     "OTE error during multiplication: {:?}",
@@ -616,10 +624,12 @@ impl<C: DklsCurve> MulReceiver<C> {
         // Only a hash of r will be sent to us so we'll
         // reconstruct r directly in bytes.
         // The variable below saves each row of r in bytes.
-        let mut rows_r_as_bytes: Vec<Vec<u8>> = Vec::with_capacity(L as usize);
+        let mut rows_r_as_bytes: Zeroizing<Vec<Vec<u8>>> =
+            Zeroizing::new(Vec::with_capacity(L as usize));
         for i in 0..L {
             // We compute the i-th row of the matrix r in bytes.
-            let mut entries_as_bytes: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE as usize);
+            let mut entries_as_bytes: Zeroizing<Vec<Vec<u8>>> =
+                Zeroizing::new(Vec::with_capacity(BATCH_SIZE as usize));
             for j in 0..BATCH_SIZE {
                 // The entry depends on the choice bits.
                 let mut entry = (-(data_kept.chi_tilde[i as usize]
@@ -635,7 +645,7 @@ impl<C: DklsCurve> MulReceiver<C> {
             let row_i_as_bytes = entries_as_bytes.concat();
             rows_r_as_bytes.push(row_i_as_bytes);
         }
-        let r_as_bytes = rows_r_as_bytes.concat();
+        let r_as_bytes = Zeroizing::new(rows_r_as_bytes.concat());
 
         // We transform r into a hash.
         let expected_verify_r: HashOutput = tagged_hash(TAG_MUL_VERIFY, &[session_id, &r_as_bytes]);

@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use rustcrypto_ff::Field;
 use rustcrypto_group::prime::PrimeCurveAffine;
 use rustcrypto_group::Curve;
+use zeroize::Zeroizing;
 
 use crate::curve::DklsCurve;
 use crate::utilities::rng;
@@ -54,7 +55,8 @@ pub fn re_key<C: DklsCurve>(
 
     // We will compute "poly_point" for each party with this polynomial
     // via Shamir's secret sharing.
-    let mut polynomial: Vec<C::Scalar> = Vec::with_capacity(parameters.threshold as usize);
+    let mut polynomial: Zeroizing<Vec<C::Scalar>> =
+        Zeroizing::new(Vec::with_capacity(parameters.threshold as usize));
     polynomial.push(*secret_key);
     for _ in 1..parameters.threshold {
         polynomial.push(C::Scalar::random(&mut rng::get_rng()));
@@ -68,14 +70,14 @@ pub fn re_key<C: DklsCurve>(
     // (1,3), ..., (1,n). The second entry contains the seeds for the pairs
     // (2,3), (2,4), ..., (2,n), and so on. The last entry contains the
     // seed for the pair (n-1, n).
-    let mut common_seeds: Vec<Vec<zero_shares::Seed>> =
+    let mut common_seeds: Vec<Zeroizing<Vec<zero_shares::Seed>>> =
         Vec::with_capacity((parameters.share_count - 1) as usize);
     for lower_index in 1..parameters.share_count {
-        let mut seeds_with_lower_index: Vec<zero_shares::Seed> =
-            Vec::with_capacity((parameters.share_count - lower_index) as usize);
+        let mut seeds_with_lower_index: Zeroizing<Vec<zero_shares::Seed>> = Zeroizing::new(
+            Vec::with_capacity((parameters.share_count - lower_index) as usize),
+        );
         for _ in (lower_index + 1)..=parameters.share_count {
-            let seed = rng::get_rng().random::<zero_shares::Seed>();
-            seeds_with_lower_index.push(seed);
+            seeds_with_lower_index.push(rng::get_rng().random::<zero_shares::Seed>());
         }
         common_seeds.push(seeds_with_lower_index);
     }
@@ -129,30 +131,34 @@ pub fn re_key<C: DklsCurve>(
             // We first compute the data for the OT extension.
 
             // Receiver: Sample the seeds.
-            let mut seeds0: Vec<HashOutput> = Vec::with_capacity(ot::extension::KAPPA as usize);
-            let mut seeds1: Vec<HashOutput> = Vec::with_capacity(ot::extension::KAPPA as usize);
+            let mut ote_receiver = OTEReceiver {
+                seeds0: Vec::with_capacity(ot::extension::KAPPA as usize),
+                seeds1: Vec::with_capacity(ot::extension::KAPPA as usize),
+            };
             for _ in 0..ot::extension::KAPPA {
-                seeds0.push(rng::get_rng().random::<HashOutput>());
-                seeds1.push(rng::get_rng().random::<HashOutput>());
+                ote_receiver
+                    .seeds0
+                    .push(rng::get_rng().random::<HashOutput>());
+                ote_receiver
+                    .seeds1
+                    .push(rng::get_rng().random::<HashOutput>());
             }
 
             // Sender: Sample the correlation and choose the correct seed.
             // The choice bits are sampled randomly.
-            let mut correlation: Vec<bool> = Vec::with_capacity(ot::extension::KAPPA as usize);
-            let mut seeds: Vec<HashOutput> = Vec::with_capacity(ot::extension::KAPPA as usize);
+            let mut ote_sender = OTESender {
+                correlation: Vec::with_capacity(ot::extension::KAPPA as usize),
+                seeds: Vec::with_capacity(ot::extension::KAPPA as usize),
+            };
             for i in 0..ot::extension::KAPPA {
                 let current_bit: bool = rng::get_rng().random();
                 if current_bit {
-                    seeds.push(seeds1[i as usize]);
+                    ote_sender.seeds.push(ote_receiver.seeds1[i as usize]);
                 } else {
-                    seeds.push(seeds0[i as usize]);
+                    ote_sender.seeds.push(ote_receiver.seeds0[i as usize]);
                 }
-                correlation.push(current_bit);
+                ote_sender.correlation.push(current_bit);
             }
-
-            let ote_receiver = OTEReceiver { seeds0, seeds1 };
-
-            let ote_sender = OTESender { correlation, seeds };
 
             // We sample the public gadget vector.
             let mut public_gadget: Vec<C::Scalar> =

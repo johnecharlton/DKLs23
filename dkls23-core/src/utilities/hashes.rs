@@ -7,6 +7,7 @@ use elliptic_curve::ops::Reduce;
 use elliptic_curve::{CurveArithmetic, FieldBytes};
 use rustcrypto_group::GroupEncoding;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::SECURITY;
 
@@ -30,8 +31,9 @@ fn append_len_prefixed(encoded: &mut Vec<u8>, component: &[u8]) {
 /// `len(tag)||tag||len(component_0)||component_0||...`.
 #[must_use]
 pub fn tagged_hash(tag: &[u8], components: &[&[u8]]) -> HashOutput {
-    let mut encoded =
-        Vec::with_capacity(8 + tag.len() + components.iter().map(|c| 8 + c.len()).sum::<usize>());
+    let mut encoded = Zeroizing::new(Vec::with_capacity(
+        8 + tag.len() + components.iter().map(|c| 8 + c.len()).sum::<usize>(),
+    ));
     append_len_prefixed(&mut encoded, tag);
     for component in components {
         append_len_prefixed(&mut encoded, component);
@@ -45,7 +47,7 @@ pub fn tagged_hash_as_scalar<C: CurveArithmetic>(tag: &[u8], components: &[&[u8]
 where
     C::Scalar: Reduce<FieldBytes<C>>,
 {
-    let as_bytes = tagged_hash(tag, components);
+    let as_bytes = Zeroizing::new(tagged_hash(tag, components));
     reduce_hash_to_scalar::<C>(&as_bytes)
 }
 
@@ -69,7 +71,7 @@ where
 /// This function writes this integer as a byte array.
 #[must_use]
 pub fn scalar_to_bytes<C: CurveArithmetic>(scalar: &C::Scalar) -> Vec<u8> {
-    let fb: FieldBytes<C> = (*scalar).into();
+    let fb: Zeroizing<FieldBytes<C>> = Zeroizing::new((*scalar).into());
     <FieldBytes<C> as AsRef<[u8]>>::as_ref(&fb).to_vec()
 }
 
