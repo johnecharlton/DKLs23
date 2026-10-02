@@ -396,14 +396,15 @@ pub(crate) fn step5<C: DklsCurve>(
     // The common value calculated is the public key.
     for i in 1..=(parameters.share_count - parameters.threshold + 1) {
         let mut current_pk = identity;
-        for j in i..(i + parameters.threshold) {
+        let last_index = i + (parameters.threshold - 1);
+        for j in i..=last_index {
             // We find the Lagrange coefficient l(j) corresponding to j (and the contiguous set of parties).
             // It is such that the sum of l(j) * p(j) over all j is p(0), where p is the polynomial from Step 3.
             let j_scalar = C::Scalar::from(u64::from(j));
             let mut lj_numerator = <C::Scalar as Field>::ONE;
             let mut lj_denominator = <C::Scalar as Field>::ONE;
 
-            for k in i..(i + parameters.threshold) {
+            for k in i..=last_index {
                 if k != j {
                     let k_scalar = C::Scalar::from(u64::from(k));
                     lj_numerator *= k_scalar;
@@ -1653,6 +1654,43 @@ mod tests {
         let expected_pk = (AffinePoint::GENERATOR * Scalar::from(2u32).negate()).to_affine();
         for pk in public_keys {
             assert_eq!(pk, expected_pk);
+        }
+    }
+
+    /// Tests reconstruction with 255 parties and rejects a missing final proof.
+    #[test]
+    fn test_dkg_reconstruction_max_share_count() {
+        let session_id = rng::get_rng().random::<[u8; crate::utilities::ID_LEN]>();
+        let party_index = PartyIndex::new(1).unwrap();
+
+        // The polynomial p(x) = x + 7 is valid for both tested thresholds.
+        let mut proofs_commitments = Vec::with_capacity(u8::MAX as usize);
+        for i in 1..=u8::MAX {
+            let poly_point = Scalar::from(u64::from(i)) + Scalar::from(7u32);
+            let (_, proof_commitment) =
+                step3::<TestCurve>(PartyIndex::new(i).unwrap(), &session_id, &[poly_point]);
+            proofs_commitments.push(proof_commitment);
+        }
+
+        let expected_pk = (AffinePoint::GENERATOR * Scalar::from(7u32)).to_affine();
+        for threshold in [2, u8::MAX] {
+            let parameters = Parameters::new(threshold, u8::MAX).unwrap();
+            let (pk, _) =
+                step5::<TestCurve>(&parameters, party_index, &session_id, &proofs_commitments)
+                    .expect("maximum-size reconstruction should succeed");
+            assert_eq!(pk, expected_pk);
+
+            let abort = step5::<TestCurve>(
+                &parameters,
+                party_index,
+                &session_id,
+                &proofs_commitments[..(u8::MAX as usize) - 1],
+            )
+            .expect_err("missing final proof should be rejected");
+            assert!(matches!(
+                abort.reason,
+                AbortReason::MissingCommittedPoint { party } if party.as_u8() == u8::MAX
+            ));
         }
     }
 
